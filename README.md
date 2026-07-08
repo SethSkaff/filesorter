@@ -16,9 +16,9 @@ A native desktop file sorting application built with PyQt6. No browser, no serve
 - **File viewers** — images (with zoom/pan), video (with playback controls), audio, PDF (rendered pages via pymupdf), text/code, and a generic viewer for everything else
 - **Mouse swipe** — click-hold-drag the file preview left (delete) or right (skip); releases before the threshold snap back with a spring animation; color overlay (red/green) shows intent
 - **Keyboard shortcuts** — ← delete · → skip · A prev · D skip · Space play/pause · 1-9 / Q-P move to folder · ⌘Z/Ctrl+Z undo
-- **Undo** — one level, works for moves and deletes (files are staged in `._sorter_trash/` until the session ends, then sent to OS trash)
+- **Undo** — one level, works for moves and sorter deletes; deleted files are staged in `._sorter_trash/` during the session, then sent to OS trash on exit
 - **Thumbnail strip** — shows upcoming files at the bottom; click any thumbnail to jump
-- **Disk Analyzer** — scan any folder (or the whole computer) for the largest files and folders; delete directly from results
+- **Disk Analyzer** — scan any folder (or the whole computer) for the largest files and folders; confirmed analyzer deletes go directly to OS trash
 - **Session persistence** — saves progress to `sorter_config.json` inside the sorted folder; offers to resume on next launch
 - **Live stats** — progress bar, file counter, running total of deleted storage
 - **Toast notifications** — every action shows a brief bottom-center toast with undo hint
@@ -139,5 +139,5 @@ FileSorter/
 ## Notes
 
 - **Video/audio** requires `PyQt6-Qt6Multimedia` and platform media backends. On Windows, ensure Windows Media Player / DirectShow codecs are installed. On macOS, AVFoundation is used automatically.
-- **Undo of deletes**: files are moved to a hidden `._sorter_trash/` folder inside the source folder while sorting. They are only permanently trashed when you navigate back or close. This makes delete fully reversible within a session.
+- **Undo of deletes**: sorter deletes first move files to a hidden `._sorter_trash/` folder inside the source folder and record their original paths in a manifest. `Ctrl+Z` / `⌘Z` restores the staged file in-app during the session. When you navigate back, start a new sorting session, or close FileSorter, remaining staged files are sent to the OS trash and the staging folder is cleaned up.
 - **sorter_config.json** is written to the sorted folder's root. Delete it to reset the session for that folder.

@@ -16,6 +16,7 @@ import subprocess
 import platform
 import mimetypes
 import tempfile
+import uuid
 from pathlib import Path
 from datetime import datetime
 
@@ -250,6 +251,14 @@ def safe_move(src: Path, dst_folder: Path) -> Path:
     shutil.move(str(src), str(dst))
     return dst
 
+def send_path_to_os_trash(path: Path):
+    if HAS_SEND2TRASH:
+        send2trash.send2trash(str(path))
+    elif path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
 def folder_size(path: Path) -> int:
     total = 0
     try:
@@ -278,6 +287,138 @@ def dir_total_size(path: Path) -> int:
 # ─── Session persistence ──────────────────────────────────────────────────────
 
 CONFIG_FILENAME = "sorter_config.json"
+TRASH_DIR_NAME = "._sorter_trash"
+TRASH_MANIFEST_FILENAME = "manifest.json"
+
+def trash_dir(folder: Path) -> Path:
+    return folder / TRASH_DIR_NAME
+
+def trash_manifest_path(folder: Path) -> Path:
+    return trash_dir(folder) / TRASH_MANIFEST_FILENAME
+
+def load_trash_manifest(folder: Path) -> dict:
+    manifest_path = trash_manifest_path(folder)
+    if not manifest_path.exists():
+        return {}
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+def save_trash_manifest(folder: Path, manifest: dict):
+    staging = trash_dir(folder)
+    staging.mkdir(parents=True, exist_ok=True)
+    manifest_path = trash_manifest_path(folder)
+    tmp = manifest_path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    tmp.replace(manifest_path)
+
+def cleanup_empty_trash_dir(folder: Path):
+    staging = trash_dir(folder)
+    if not staging.exists():
+        return
+    try:
+        manifest_path = trash_manifest_path(folder)
+        if manifest_path.exists() and not load_trash_manifest(folder):
+            manifest_path.unlink()
+        next(staging.iterdir())
+    except StopIteration:
+        staging.rmdir()
+    except Exception:
+        pass
+
+def stage_for_delete(path: Path, folder: Path) -> dict:
+    staging = trash_dir(folder)
+    staging.mkdir(parents=True, exist_ok=True)
+    item_id = f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}_{uuid.uuid4().hex[:8]}"
+    staged_path = collision_free(staging / f"{item_id}{path.suffix}")
+    size = path.stat().st_size if path.exists() and path.is_file() else 0
+    manifest = load_trash_manifest(folder)
+    try:
+        shutil.move(str(path), str(staged_path))
+        entry = {
+            "id": item_id,
+            "original_path": str(path),
+            "staged_path": str(staged_path),
+            "original_name": path.name,
+            "staged_at": datetime.now().isoformat(timespec="seconds"),
+            "size": size,
+        }
+        manifest[item_id] = entry
+        save_trash_manifest(folder, manifest)
+        return entry
+    except Exception:
+        if staged_path.exists() and not path.exists():
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(staged_path), str(path))
+            except Exception:
+                pass
+        raise
+
+def restore_staged_delete(folder: Path, item_id: str) -> Path:
+    manifest = load_trash_manifest(folder)
+    entry = manifest.get(item_id)
+    if not entry:
+        raise FileNotFoundError("Trash staging record was not found")
+    staged_path = Path(entry["staged_path"])
+    original_path = Path(entry["original_path"])
+    if not staged_path.exists():
+        manifest.pop(item_id, None)
+        save_trash_manifest(folder, manifest)
+        cleanup_empty_trash_dir(folder)
+        raise FileNotFoundError("Staged file is missing")
+
+    original_path.parent.mkdir(parents=True, exist_ok=True)
+    restore_path = original_path if not original_path.exists() else collision_free(original_path)
+    shutil.move(str(staged_path), str(restore_path))
+    manifest.pop(item_id, None)
+    save_trash_manifest(folder, manifest)
+    cleanup_empty_trash_dir(folder)
+    return restore_path
+
+def flush_trash_staging(folder: Path):
+    staging = trash_dir(folder)
+    if not staging.exists():
+        return
+
+    manifest = load_trash_manifest(folder)
+    staged_paths: list[Path] = []
+    for entry in manifest.values():
+        staged = entry.get("staged_path") if isinstance(entry, dict) else None
+        if staged:
+            staged_paths.append(Path(staged))
+
+    try:
+        for child in staging.iterdir():
+            if child.name != TRASH_MANIFEST_FILENAME:
+                staged_paths.append(child)
+    except Exception:
+        pass
+
+    seen: set[str] = set()
+    failures = False
+    for staged_path in staged_paths:
+        key = str(staged_path)
+        if key in seen or not staged_path.exists():
+            continue
+        seen.add(key)
+        try:
+            send_path_to_os_trash(staged_path)
+        except Exception:
+            failures = True
+
+    try:
+        manifest_path = trash_manifest_path(folder)
+        if not failures and manifest_path.exists():
+            manifest_path.unlink()
+        if not failures:
+            cleanup_empty_trash_dir(folder)
+    except Exception:
+        pass
 
 def load_session(folder: Path) -> dict | None:
     cfg = folder / CONFIG_FILENAME
@@ -2253,12 +2394,8 @@ class SortingScreen(QWidget):
         if self._current_viewer and hasattr(self._current_viewer, "release"):
             self._current_viewer.release()
 
-        # Send directly to OS Recycle Bin / Trash
         try:
-            if HAS_SEND2TRASH:
-                send2trash.send2trash(str(path))
-            else:
-                path.unlink(missing_ok=True)
+            staged = stage_for_delete(path, self._folder)
         except Exception as ex:
             self._toast.show_message(f"Error: {ex}")
             return
@@ -2268,8 +2405,10 @@ class SortingScreen(QWidget):
             "action": "delete",
             "idx": self._current_idx,
             "size": size,
+            "trash_id": staged["id"],
+            "src": staged["original_path"],
         }]
-        self._toast.show_message("Sent to Recycle Bin")
+        self._toast.show_message(f"Staged for trash  -  {self._undo_hint()}")
         self._viewer_container.animate_file_out(-1)
         QTimer.singleShot(210, self._advance_after_animate)
 
@@ -2328,8 +2467,10 @@ class SortingScreen(QWidget):
         if action == "move":
             src, dst = Path(entry["src"]), Path(entry["dst"])
             try:
+                src.parent.mkdir(parents=True, exist_ok=True)
                 if dst.exists():
-                    shutil.move(str(dst), str(src))
+                    restore_path = src if not src.exists() else collision_free(src)
+                    shutil.move(str(dst), str(restore_path))
                 self._current_idx = entry["idx"]
                 self._load_files()
                 self._show_file(self._current_idx)
@@ -2338,7 +2479,22 @@ class SortingScreen(QWidget):
                 self._toast.show_message(f"Undo failed: {ex}")
 
         elif action == "delete":
-            self._toast.show_message("Deleted files are in the Recycle Bin — restore from there")
+            try:
+                restored = restore_staged_delete(self._folder, entry["trash_id"])
+                self._deleted_size = max(0, self._deleted_size - int(entry.get("size", 0)))
+                self._current_idx = entry["idx"]
+                self._load_files()
+                try:
+                    self._current_idx = self._files.index(restored)
+                except ValueError:
+                    self._current_idx = min(self._current_idx, max(0, len(self._files) - 1))
+                if self._files:
+                    self._show_file(self._current_idx)
+                else:
+                    self._show_done()
+                self._toast.show_message("Undone: delete restored")
+            except Exception as ex:
+                self._toast.show_message(f"Undo failed: {ex}")
 
         elif action == "skip":
             self._current_idx = entry["idx"]
@@ -2492,6 +2648,9 @@ class SortingScreen(QWidget):
             "keep_path":    str(self._keep_path) if self._keep_path else None,
         }
         save_session(self._folder, state)
+
+    def flush_staged_trash(self):
+        flush_trash_staging(self._folder)
 
     # ── Keyboard shortcuts ────────────────────────────────────────────────────
 
@@ -2732,13 +2891,7 @@ class DiskAnalyzerDialog(QDialog):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             try:
-                if HAS_SEND2TRASH:
-                    send2trash.send2trash(path_str)
-                else:
-                    if path.is_file():
-                        path.unlink()
-                    elif path.is_dir():
-                        shutil.rmtree(path_str)
+                send_path_to_os_trash(path)
             except Exception as ex:
                 QMessageBox.warning(self, "Error", str(ex))
 
@@ -2782,6 +2935,7 @@ class MainWindow(QMainWindow):
                 config = saved
 
         if self._sorting_screen:
+            self._sorting_screen.flush_staged_trash()
             self._stack.removeWidget(self._sorting_screen)
             self._sorting_screen.deleteLater()
 
@@ -2791,8 +2945,15 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentWidget(self._sorting_screen)
 
     def _back_to_setup(self):
+        if self._sorting_screen:
+            self._sorting_screen.flush_staged_trash()
         self._wizard.reset_to_step1()
         self._stack.setCurrentWidget(self._wizard)
+
+    def closeEvent(self, e):
+        if self._sorting_screen:
+            self._sorting_screen.flush_staged_trash()
+        super().closeEvent(e)
 
 
 class SetupWizard(QWidget):
